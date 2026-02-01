@@ -1,0 +1,16 @@
+## The source repositories and target repositories are one-to-one correspondence.
+sourceRepos:
+  - registry: brancz
+    name: kube-rbac-proxy
+    host: quay.io
+    allowed_tags:
+      - v0.14.2
+      - v0.15.0
+      - v0.18.1
+      - v0.19.1
+      - v0.20.1
+      - v0.20.2
+
+targetRepos:
+  - registry: public.ecr.aws/aws-observability
+    name: mirror-kube-rbac-proxy

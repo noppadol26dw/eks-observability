@@ -1,0 +1,24 @@
+#IDE
+.idea
+*.code-workspace
+
+#build folder
+build/
+bin/
+
+#resports
+coverage.txt
+
+# swp file
+*.swp
+
+# python libs
+venv/
+
+.DS_Store
+
+# Created by the testbed
+testbed/**/results
+
+# Testbed vendor (downloaded at build time)
+testbed/vendor/

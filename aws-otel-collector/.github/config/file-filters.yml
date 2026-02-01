@@ -1,0 +1,18 @@
+changed:
+  - '.github/workflows/PR-build.yml'
+  - 'cmd/**'
+  - 'config/**'
+  - 'deployment-template/**'
+  - 'e2etest/**'
+  - 'pkg/**'
+  - 'tools/**'
+  - 'testbed/**'
+  - 'Makefile'
+  - 'go.sum'
+  - '.patches/**'
+  - 'vendor/**'
+  - '.github/scripts/test-collector-ctl.sh'
+all:
+  - '**'
+version:
+  - 'VERSION'

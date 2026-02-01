@@ -1,0 +1,394 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# A copy of the License is located at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# or in the "license" file accompanying this file. This file is distributed
+# on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+# express or implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+name: PR Build
+
+on:
+  pull_request:
+    branches:
+      - main
+      - release/v*
+      - dev
+      - test/*
+
+env:
+  IMAGE_NAME: aws-otel-collector
+  PACKAGING_ROOT: build/packages
+  TESTING_FRAMEWORK_REPO: aws-observability/aws-otel-test-framework
+  GO_VERSION: ~1.24.11
+
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate-markdown:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Get changed files
+        id: changes
+        run: |
+          echo "MDS=$(git diff --name-only --diff-filter=ACMRTUXB $(git merge-base origin/${{ github.event.pull_request.base.ref }} ${{ github.event.pull_request.head.sha }}) ${{ github.event.pull_request.head.sha }} | grep .md$ | grep -v vendor/ | xargs)" >> $GITHUB_ENV
+
+      - name: Install markdown-link-check
+        run: npm install -g markdown-link-check@3.12.2
+        if: ${{ env.MDS }}
+
+      - name: Run markdown-link-check
+        run: |
+          markdown-link-check \
+            --verbose \
+            --config .github/config/markdown-links-config.json \
+            ${{ env.MDS }} \
+            || { echo "Check that anchor links are lowercase"; exit 1; }
+        if: ${{ env.MDS }}
+
+  create-test-ref:
+    runs-on: ubuntu-22.04
+    outputs:
+      testRef: ${{ steps.setRef.outputs.ref }}
+    steps:
+      - name: Set testRef output
+        id: setRef
+        run: |
+          if [[ ${{ github.base_ref }} == release/v* ]]; then 
+            echo "ref=${{github.base_ref}}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=terraform" >> $GITHUB_OUTPUT
+          fi
+
+  changes:
+    runs-on: ubuntu-22.04
+    outputs:
+      changed: ${{ steps.filter.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          list-files: shell
+          filters: .github/config/file-filters.yml
+
+      - name: List all updated files
+        run: |
+          for file in ${{ steps.filter.outputs.all_files }}; do
+            echo "$file"
+          done
+
+      - name: Check if this is a version bump PR
+        if: steps.filter.outputs.version == 'true'
+        run: echo "This is a version bump PR!"
+
+  build-windows:
+    runs-on:  ${{ vars.ADOTWINDOWSLARGERUNNERS || 'windows-latest' }}
+    needs: [changes]
+    steps:
+    - name: Checkout
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      uses: actions/checkout@v4
+
+    - name: apply patches
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      run: make apply-patches
+
+    # Set up building environment, patch the dev repo code on dispatch events.
+    - name: Set up Go 1.x
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: install tools
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      run: make install-tools
+
+    - name: Lint
+      if: ${{ needs.changes.outputs.changed == 'true'}}
+      run: make golint
+
+    # only run unit tests on windows. The unix build job will lint, test, and build.
+    - name: Unit test
+      if: ${{ needs.changes.outputs.changed == 'true'}}
+      run: make gotest
+
+
+  build:
+    runs-on: ${{ vars.ADOTLARGERUNNERS || 'ubuntu-22.04' }}
+    needs: [changes]
+    steps:
+    - name: Remove cache
+      run: rm -rf /opt/hostedtoolcache
+
+    - name: Free space
+      run: |
+        echo '===== Before ====='
+        df -h
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/lib/google-cloud-sdk
+        sudo rm -rf /usr/local/julia*
+        sudo rm -rf /usr/local/.ghcup
+        sudo rm -rf /usr/share/swift
+        sudo rm -rf /usr/share/dotnet
+        sudo apt-get clean
+        echo '===== After ====='
+        df -h
+
+    - name: Checkout
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      uses: actions/checkout@v4
+
+    - name: apply patches
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      run: make apply-patches
+
+    # Set up building environment, patch the dev repo code on dispatch events.
+    - name: Set up Go 1.x
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache binaries
+      id: cached_binaries
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      uses: actions/cache@v3
+      with:
+        key: "cached_binaries_${{ github.run_id }}"
+        path: build
+
+    # Linting && Unit Test and attach test coverage badge
+    - name: Tests - Lint and unit test
+      if: ${{ needs.changes.outputs.changed == 'true' && steps.cached_binaries.outputs.cache-hit != 'true' }}
+      run: make test-all
+
+    - name: Upload Coverage report to CodeCov
+      if: ${{ needs.changes.outputs.changed == 'true' && steps.cached_binaries.outputs.cache-hit != 'true' }}
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.txt
+
+    # Build and archive binaries into cache.
+    - name: Build Binaries
+      if: ${{ needs.changes.outputs.changed == 'true' && steps.cached_binaries.outputs.cache-hit != 'true' }}
+      run: PARALLEL=1 make build
+
+    # upload the binaries to artifact as well because cache@v2 hasn't support windows
+    - name: Upload
+      if: ${{ needs.changes.outputs.changed == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: binary_artifacts
+        path: build
+        retention-days: 1
+
+  packaging-msi:
+    runs-on: windows-latest
+    needs: [changes, build]
+    steps:
+      - name: Checkout
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Download built artifacts
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: binary_artifacts
+          path: build
+
+      - name: Display structure of downloaded files
+        run: ls -R
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+
+      - name: Create msi file using candle and light
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        run: .\tools\packaging\windows\create_msi.ps1
+
+  packaging-rpm:
+    runs-on: ubuntu-22.04
+    needs: [changes, build]
+    steps:
+      # Build and archive RPMs into cache.
+      - name: Checkout
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: restore cached binaries
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/cache@v3
+        with:
+          key: "cached_binaries_${{ github.run_id }}"
+          path: build
+
+      - name: Display structure of downloaded files
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        run: ls -R
+
+      - name: Build RPM
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        run: |
+          ARCH=x86_64 SOURCE_ARCH=amd64 DEST=build/packages/linux/amd64 tools/packaging/linux/create_rpm.sh
+          ARCH=aarch64 SOURCE_ARCH=arm64 DEST=build/packages/linux/arm64 tools/packaging/linux/create_rpm.sh
+
+  packaging-deb:
+    runs-on: ubuntu-22.04
+    needs: [changes, build]
+    steps:
+      # Build and archive debs into cache.
+      - name: Checkout
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Restore cached binaries
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/cache@v3
+        with:
+          key: "cached_binaries_${{ github.run_id }}"
+          path: build
+
+      - name: Cache built debian
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/cache@v3
+        with:
+          key: "cached_deb_${{ github.run_id }}"
+          path: build/packages/debian
+
+      - name: Build Debs
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        run: |
+          ARCH=amd64 DEST=build/packages/debian/amd64 tools/packaging/debian/create_deb.sh
+          ARCH=arm64 DEST=build/packages/debian/arm64 tools/packaging/debian/create_deb.sh
+
+  test-control-stript:
+    runs-on: ubuntu-22.04
+    needs: [changes, packaging-deb]
+    steps:
+      - name: Checkout
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Restore cached deb
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/cache@v3
+        with:
+          key: "cached_deb_${{ github.run_id }}"
+          path: build/packages/debian
+
+      - name: Execute tests
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        run: |
+          file ./build/packages/debian/amd64/aws-otel-collector.deb
+          sudo ./.github/scripts/test-collector-ctl.sh ./build/packages/debian/amd64/aws-otel-collector.deb ./config.yaml
+
+  get-test-cases:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Get all the testing suites
+        id: set-matrix
+        run: | 
+          matrix=$(python e2etest/get-testcases.py local_matrix)
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+      - name: List testing suites
+        run: |
+          echo ${{ steps.set-matrix.outputs.matrix }}
+
+  run-test-case:
+    runs-on: ubuntu-22.04
+    needs: [changes, get-test-cases, build, create-test-ref]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.get-test-cases.outputs.matrix) }}
+    steps:
+      - name: Check out testing framework
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TESTING_FRAMEWORK_REPO }}
+          path: testing-framework
+          ref: ${{ needs.create-test-ref.outputs.testRef }}
+
+      - name: Check out Collector
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          path: aws-otel-collector
+
+      - name: Set up JDK 11
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '11'
+
+      - name: Set up terraform
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      - name: restore cached binaries
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/cache@v3
+        with:
+          key: "cached_binaries_${{ github.run_id }}"
+          path: build
+
+      - name: copy binary
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        run: cp -R build aws-otel-collector/build
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_PR_BUILD_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to Public Integration Test ECR
+        uses: docker/login-action@v3
+        with:
+          registry: public.ecr.aws
+        env:
+          AWS_REGION: us-east-1
+
+      - name: Run test
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: nick-invision/retry@v2
+        with:
+          max_attempts: 2
+          timeout_minutes: 10
+          command: |
+            if [[ -f testing-framework/terraform/testcases/${{ matrix.testcase }}/parameters.tfvars ]] ; then opts="-var-file=../testcases/${{ matrix.testcase }}/parameters.tfvars" ; else opts="" ; fi
+            cd testing-framework/terraform/mock && terraform init && terraform apply -auto-approve -var="testcase=../testcases/${{ matrix.testcase }}" $opts
+          on_retry_command: |
+            cd testing-framework/terraform/mock && terraform destroy -auto-approve && sleep $((RANDOM % 10))
+        env:
+          DOCKER_BUILDKIT: 1 # Required for TARGETARCH to be populated with Docker compose.

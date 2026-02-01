@@ -1,0 +1,906 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# A copy of the License is located at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# or in the "license" file accompanying this file. This file is distributed
+# on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+# express or implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+name: C/I
+on:
+  push:
+    branches:
+      - main
+      - release/v*
+      - dev
+      - test/*
+    paths-ignore:
+      - '.github/**'
+      - '!.github/config/testcases.json'
+      - '!.github/workflows/CI.yml'
+      - '!.github/workflows/CI-Operator.yml'
+      - '**.md'
+      - 'tools/workflow/**'
+
+  # from collector and collector-contrib repo
+  repository_dispatch:
+    types: [dependency-build, workflow-run]
+
+env:
+  IMAGE_NAME: aws-otel-collector
+  PACKAGING_ROOT: build/packages
+  ECR_REPO: aws-otel-test/adot-collector-integration-test
+  # TF_VAR_patch: 'true'
+  PKG_SIGN_PRIVATE_KEY_NAME: aoc-linux-pkg-signing-gpg-key
+  WIN_UNSIGNED_PKG_BUCKET: aoc-aws-signer-unsigned-artifact-src
+  WIN_SIGNED_PKG_BUCKET: aoc-aws-signer-signed-artifact-dest
+  WIN_UNSIGNED_PKG_FOLDER: OTelCollectorAuthenticode/AuthenticodeSigner-SHA256-RSA
+  WIN_SIGNED_PKG_FOLDER: OTelCollectorAuthenticode/AuthenticodeSigner-SHA256-RSA
+  SSM_PACKAGE_NAME: "testAWSDistroOTel-Collector"
+  EKS_ARM_64_AMP_ENDPOINT: "https://aps-workspaces.us-west-2.amazonaws.com/workspaces/ws-e0c3c74f-7fdf-4e90-87d2-a61f52df40cd"
+  EKS_ARM_64_CLUSTER_NAME: "collector-ci-arm64-1-21"
+  EKS_ARM_64_REGION: "us-west-2"
+  TESTING_FRAMEWORK_REPO: aws-observability/aws-otel-test-framework
+  GITHB_RUN_ID: ${{ github.run_id }}
+  DDB_TABLE_NAME: BatchTestCache
+  MAX_JOBS: 110
+  BATCH_INCLUDED_SERVICES: EKS,ECS,EC2,EKS_ARM64,EKS_FARGATE
+  GO_VERSION: ~1.24.11
+
+
+concurrency:
+  group: ci-batched${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate-markdown:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install markdown-link-check
+        run: npm install -g markdown-link-check@3.12.2
+
+      - name: Run markdown-link-check in the developers docs
+        run: |
+          find ./docs/developers -name "*.md" | xargs markdown-link-check \
+            --verbose \
+            --config .github/config/markdown-links-config.json \
+            || { echo "Check that anchor links are lowercase"; exit 1; }
+      - name: Run markdown-link-check on main documentation
+        run: |
+          markdown-link-check \
+          --verbose \
+          --config .github/config/markdown-links-config.json \
+          README.md CONTRIBUTING.md CODE_OF_CONDUCT.md \
+          || { echo "Check that anchor links are lowercase"; exit 1; } 
+
+  create-test-ref:
+    runs-on: ubuntu-22.04
+    needs: validate-markdown
+    outputs:
+      testRef: ${{ steps.setRef.outputs.ref }}
+    steps:
+      - name: Set testRef output
+        id: setRef
+        run: |
+          if [[ ${{ github.ref_name }} == release/v* ]]; then 
+            echo "ref=${{github.ref_name}}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=terraform" >> $GITHUB_OUTPUT
+          fi
+
+  build-aotutil:
+    runs-on: ubuntu-22.04
+    needs: create-test-ref
+    steps:
+      - name: Check out testing framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TESTING_FRAMEWORK_REPO }}
+          path: testing-framework
+          ref: ${{ needs.create-test-ref.outputs.testRef }}
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: testing-framework/cmd/aotutil/go.sum
+      - name: Build aotutil
+        run: cd testing-framework/cmd/aotutil && make build
+      - name: Cache aotutil
+        uses: actions/cache@v3
+        with:
+          key: "aotutil_${{ hashFiles('testing-framework/cmd/aotutil/*.go') }}_${{ hashFiles('testing-framework/cmd/aotutil/go.sum') }}"
+          path: testing-framework/cmd/aotutil/aotutil
+
+  build:
+    needs:
+      - create-test-ref
+    runs-on: ${{ vars.ADOTLARGERUNNERS || 'ubuntu-22.04' }}
+
+    steps:
+    - name: Remove cache
+      run: rm -rf /opt/hostedtoolcache
+
+    - name: Free space
+      run: |
+        echo '===== Before ====='
+        df -h
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/lib/google-cloud-sdk
+        sudo rm -rf /usr/local/julia*
+        sudo rm -rf /usr/local/.ghcup
+        sudo rm -rf /usr/share/swift
+        sudo rm -rf /usr/share/dotnet
+        sudo apt-get clean
+        echo '===== After ====='
+        df -h
+
+    - uses: actions/checkout@v4
+
+    - name: apply patches
+      run: make apply-patches
+
+    # Set up building environment, patch the dev repo code on dispatch events.
+    - name: Set up Go 1.x
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Checkout dev opentelemetry-collector-contrib
+      if: github.event_name == 'repository_dispatch' && github.event.action == 'dependency-build'
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository_owner }}/opentelemetry-collector-contrib
+        ref: main
+        path: pkg/opentelemetry-collector-contrib
+
+    - name: Checkout dev opentelemetry-collector
+      if: github.event_name == 'repository_dispatch' && github.event.action == 'dependency-build'
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository_owner }}/opentelemetry-collector
+        ref: main
+        path: pkg/opentelemetry-collector
+
+    - name: append replace statement to go.mod to build with dev repo
+      if: github.event_name == 'repository_dispatch' && github.event.action == 'dependency-build'
+      run: |
+        echo "replace github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsxrayexporter => ./pkg/opentelemetry-collector-contrib/exporter/awsxrayexporter" >> go.mod
+        echo "replace go.opentelemetry.io/collector => ./pkg/opentelemetry-collector" >> go.mod
+        cat go.mod
+        ls pkg
+
+    - name: Cache binaries
+      id: cached_binaries
+      uses: actions/cache@v3
+      with:
+        key: "cached_binaries_${{ github.run_id }}"
+        path: build
+
+    # Unit Test and attach test coverage badge
+    - name: Unit Test
+      if: steps.cached_binaries.outputs.cache-hit != 'true'
+      run: make gotest
+
+    - name: Upload Coverage report to CodeCov
+      if: steps.cached_binaries.outputs.cache-hit != 'true'
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.txt
+
+    # Build and archive binaries into cache.
+    - name: Build Binaries
+      if: steps.cached_binaries.outputs.cache-hit != 'true'
+      run: PARALLEL=1 make build
+
+    # upload the binaries to artifact as well because cache@v3 hasn't support windows
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: binary_artifacts
+        path: build
+        retention-days: 1
+
+  packaging-msi:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: binary_artifacts
+          path: build
+
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: Create msi file using candle and light
+        run: .\tools\packaging\windows\create_msi.ps1
+
+      - name: Install AWS Cli v2
+        run: |
+          msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2.msi /qn
+          cmd /c where aws
+          [System.Environment]::SetEnvironmentVariable('Path',$Env:Path + ";C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe",'User')
+          aws --version
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_PROD_PKG_SIGNER_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Sign windows artifacts
+        run: |
+          $pkgfile = "build\packages\windows\amd64\aws-otel-collector.msi"
+          $hashobj = Get-FileHash -Algorithm sha256 $pkgfile
+          $hash = $hashobj.Hash
+          $create_date = Get-Date -format s
+          aws s3api put-object "--body" $pkgfile "--bucket" ${{ env.WIN_UNSIGNED_PKG_BUCKET }} "--key" ${{ env.WIN_UNSIGNED_PKG_FOLDER }}/aws-otel-collector-$hash.msi
+          $objkey = ""
+          for ($num = 1 ; $num -le 10 ; $num++) { # 60 * 10 = 600s = 10min timeout
+             Start-Sleep -s 90
+             Write-Output "Poll number $num"
+             msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2.msi /qn
+             cmd /c where aws
+             [System.Environment]::SetEnvironmentVariable('Path',$Env:Path + ";C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe",'User')
+             aws --version
+             $objkey = aws s3api list-objects "--bucket" ${{ env.WIN_SIGNED_PKG_BUCKET }} "--prefix" ${{ env.WIN_SIGNED_PKG_FOLDER }}/aws-otel-collector-$hash.msi "--output" text "--query" "Contents[?LastModified>'$create_date'].Key|[0]"
+             if ($objkey -ne "None") {
+               Write-Output "Found: $objkey"
+               break
+             } else {
+               Write-Output "$objkey returned, obj not available yet, try again later"
+             }
+          }
+          if ($objkey -eq "None") {
+            Throw "Could not find the signed artifact"
+          }
+          aws s3api get-object "--bucket" ${{ env.WIN_SIGNED_PKG_BUCKET }} "--key" $objkey $pkgfile
+
+      - name: Verify package signature
+        run: |
+          $pkgfile = "build\packages\windows\amd64\aws-otel-collector.msi"
+          $sig = Get-AuthenticodeSignature $pkgfile
+          $status = $sig.Status
+          if ($status -ne "Valid") {
+            Throw "Invalid signature found: $status"
+          }
+          Write-Output "Valid signature found from the package"
+      - name: Upload the msi
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi_artifacts
+          path: "${{ env.PACKAGING_ROOT }}"
+          retention-days: 1
+
+  packaging-rpm:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      # Build and archive rpms into cache.
+      - uses: actions/checkout@v4
+
+      - name: Cache rpms
+        id: cached_rpms
+        uses: actions/cache@v3
+        with:
+          key: "cached_rpms_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - name: restore cached binaries
+        if: steps.cached_rpms.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          key: "cached_binaries_${{ github.run_id }}"
+          path: build
+
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: Build RPM
+        if: steps.cached_rpms.outputs.cache-hit != 'true'
+        run: |
+          ARCH=x86_64 SOURCE_ARCH=amd64 DEST=$PACKAGING_ROOT/linux/amd64 tools/packaging/linux/create_rpm.sh
+          ARCH=aarch64 SOURCE_ARCH=arm64 DEST=$PACKAGING_ROOT/linux/arm64 tools/packaging/linux/create_rpm.sh
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_PROD_PKG_SIGNER_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Download Package Signing GPG key
+        if: steps.cached_rpms.outputs.cache-hit != 'true'
+        run: |
+          aws secretsmanager get-secret-value --region us-west-2 --secret-id "$PKG_SIGN_PRIVATE_KEY_NAME" | jq -r ".SecretString" > pkg_sign_private.key
+          md5sum pkg_sign_private.key
+
+      - name: Import Package Signing GPG Key
+        if: steps.cached_rpms.outputs.cache-hit != 'true'
+        run: |
+          gpg --import pkg_sign_private.key
+          gpg --list-keys
+          gpg --armor --export -a "aws-otel-collector@amazon.com" > pkg_sign_public.key
+          rpm --import pkg_sign_public.key
+          echo "%_gpg_name aws-otel-collector@amazon.com" > ~/.rpmmacros
+          md5sum pkg_sign_public.key
+          shred -fuvz pkg_sign_private.key
+      - name: Sign RPM Pakcage
+        if: steps.cached_rpms.outputs.cache-hit != 'true'
+        run: |
+          rpmsign --addsign $PACKAGING_ROOT/linux/*/*.rpm
+      - name: Remove Package Signing GPG Key from local GPG Key Ring
+        if: steps.cached_rpms.outputs.cache-hit != 'true'
+        run: |
+          gpg --fingerprint --with-colons aws-otel-collector@amazon.com grep "^fpr" | sed -n 's/^fpr:::::::::\([[:alnum:]]\+\):/\1/p' | xargs gpg --batch --yes --delete-secret-keys
+          gpg --list-secret-keys
+  packaging-deb:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      # Build and archive debs into cache.
+      - uses: actions/checkout@v4
+
+      - name: Cache Debs
+        id: cached_debs
+        uses: actions/cache@v3
+        with:
+          key: "cached_debs_${{ github.run_id }}"
+          path: ${{ env.PACKAGING_ROOT }}
+
+      - name: restore cached binaries
+        if: steps.cached_debs.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          key: "cached_binaries_${{ github.run_id }}"
+          path: build
+
+      - name: Build Debs
+        if: steps.cached_debs.outputs.cache-hit != 'true'
+        run: |
+          ARCH=amd64 DEST=$PACKAGING_ROOT/debian/amd64 tools/packaging/debian/create_deb.sh
+          ARCH=arm64 DEST=$PACKAGING_ROOT/debian/arm64 tools/packaging/debian/create_deb.sh
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_PROD_PKG_SIGNER_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Download Package Signing GPG key
+        if: steps.cached_debs.outputs.cache-hit != 'true'
+        run: |
+          aws secretsmanager get-secret-value --region us-west-2 --secret-id "$PKG_SIGN_PRIVATE_KEY_NAME" | jq -r ".SecretString" > pkg_sign_private.key
+          md5sum pkg_sign_private.key
+
+      - name: Import Package Signing GPG Key
+        if: steps.cached_debs.outputs.cache-hit != 'true'
+        run: |
+          gpg --import pkg_sign_private.key
+          gpg --list-secret-keys
+          shred -fuvz pkg_sign_private.key
+      - name: Sign DEB Pakcage
+        if: steps.cached_debs.outputs.cache-hit != 'true'
+        run: |
+          sudo apt install -y dpkg-sig
+          dpkg-sig --sign origin -k "aws-otel-collector@amazon.com" $PACKAGING_ROOT/debian/*/*.deb
+      - name: Remove Package Signing GPG Key from local GPG Key Ring
+        if: steps.cached_debs.outputs.cache-hit != 'true'
+        run: |
+          gpg --fingerprint --with-colons aws-otel-collector@amazon.com grep "^fpr" | sed -n 's/^fpr:::::::::\([[:alnum:]]\+\):/\1/p' | xargs gpg --batch --yes --delete-secret-keys
+          gpg --list-secret-keys
+
+  test-control-stript:
+    runs-on: ubuntu-22.04
+    needs: [packaging-deb]
+    steps:
+      - name: Checkout
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Restore cached Debs
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/cache@v3
+        with:
+          key: "cached_debs_${{ github.run_id }}"
+          path: ${{ env.PACKAGING_ROOT }}
+
+      - name: Execute tests
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        run: |
+          sudo ./.github/scripts/test-collector-ctl.sh $PACKAGING_ROOT/debian/amd64/aws-otel-collector.deb ./config.yaml
+
+  packaging-ssm:
+    runs-on: ubuntu-22.04
+    needs: [packaging-rpm, packaging-deb, packaging-msi]
+    steps:
+      # Build and archive SSM package into cache.
+      - uses: actions/checkout@v4
+
+      - name: Cache SSM files
+        id: cached_ssm
+        uses: actions/cache@v3
+        with:
+          key: "cached_ssm_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}/ssm"
+
+      - name: Restore cached rpms
+        if: steps.cached_ssm.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          key: "cached_rpms_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - name: Restore cached debs
+        if: steps.cached_ssm.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          key: "cached_debs_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - name: Download built artifacts
+        if: steps.cached_ssm.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: msi_artifacts
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - run: ls -R
+
+        # Build the ssm package and manifest by using a version with github short sha as same as e2etest-preparation.
+      - name: Create zip file and manifest for SSM package
+        if: steps.cached_ssm.outputs.cache-hit != 'true'
+        run: |
+          ssm_pkg_version="$(cat VERSION)-$(git rev-parse --short HEAD)"
+          rm -rf $PACKAGING_ROOT/ssm
+          python3 tools/ssm/ssm_manifest.py ${ssm_pkg_version}
+  e2etest-preparation:
+    runs-on: ubuntu-22.04
+    needs: [packaging-rpm, packaging-deb, packaging-msi, packaging-ssm]
+    outputs:
+      version: ${{ steps.versioning.outputs.version }}
+    steps:
+      # Archive all the packages into one, and build a unique version number for e2etesting
+      - uses: actions/checkout@v4
+
+      - name: Cache the packages
+        id: cached_packages
+        uses: actions/cache@v3
+        with:
+          key: "cached_packages_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - name: Restore cached rpms
+        if: steps.cached_packages.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          key: "cached_rpms_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - name: Restore cached debs
+        if: steps.cached_packages.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          key: "cached_debs_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - name: Download built artifacts
+        if: steps.cached_packages.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: msi_artifacts
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - name: Restore cached ssm
+        if: steps.cached_packages.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          key: "cached_ssm_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}/ssm"
+
+      - run: ls -R
+
+      # Build a version with github short sha for the following reasons:
+      # - Distingush each build for Integration test
+      # - Increase more visibility to the customer and also for the dev since we publish the image for integration test.
+      # - Avoid having similar layers image and only have a final result image.
+      - name: Versioning for testing
+        id: versioning
+        run: |
+          version="$(cat VERSION)-$(git rev-parse --short HEAD)"
+          echo $version > $PACKAGING_ROOT/VERSION
+          cat $PACKAGING_ROOT/VERSION
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+  e2etest-release:
+    runs-on: ubuntu-22.04
+    needs: [e2etest-preparation]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache if success
+        id: e2etest-release
+        uses: actions/cache@v3
+        with:
+          path: |
+            VERSION
+          key: e2etest-release-${{ github.run_id }}
+
+      - name: restore cached rpms
+        uses: actions/cache@v3
+        with:
+          key: "cached_packages_${{ github.run_id }}"
+          path: "${{ env.PACKAGING_ROOT }}"
+
+      - name: Restore cached binaries
+        if: steps.e2etest-release.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          key: "cached_binaries_${{ github.run_id }}"
+          path: build
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Login to Public Integration Test ECR
+        if: steps.e2etest-release.outputs.cache-hit != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: public.ecr.aws
+        env:
+          AWS_REGION: us-east-1
+
+      - name: Create SSM package
+        run: |
+          ssm_pkg_version=`cat build/packages/VERSION`
+          (aws ssm describe-document --name ${SSM_PACKAGE_NAME} --version-name ${ssm_pkg_version} >/dev/null 2>&1) || {
+            pip3 install boto3
+            python3 tools/ssm/ssm_manifest.py ${ssm_pkg_version}
+            aws s3 cp build/packages/ssm s3://aws-otel-collector-test/ssm/${ssm_pkg_version} --recursive
+            python3 tools/ssm/ssm_create.py ${SSM_PACKAGE_NAME} ${ssm_pkg_version} aws-otel-collector-test/ssm/${ssm_pkg_version} us-west-2
+          }
+      - name: Upload to S3 in the testing stack
+        if: steps.e2etest-release.outputs.cache-hit != 'true'
+        run: s3_bucket_name=aws-otel-collector-test upload_to_latest=0 bash tools/release/image-binary-release/s3-release.sh
+
+      - name: Set up Docker Buildx
+        if: steps.e2etest-release.outputs.cache-hit != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        if: steps.e2etest-release.outputs.cache-hit != 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: public.ecr.aws/${{ env.ECR_REPO }}
+
+      #Build the adot collector image for two primary reasons:
+      #-Using the adot collector image to do the integration test
+      #-Export it for delivery version image in CD
+      #Documentation: https://github.com/docker/build-push-action
+      - name: Build ADOT collector image
+        uses: docker/build-push-action@v5
+        if: steps.e2etest-release.outputs.cache-hit != 'true'
+        with:
+          file: cmd/awscollector/Dockerfile
+          context: .
+          push: true
+          tags: |
+            public.ecr.aws/${{ env.ECR_REPO }}:${{ needs.e2etest-preparation.outputs.version }}
+            public.ecr.aws/${{ env.ECR_REPO }}:latest
+          build-args: BUILDMODE=copy
+          cache-from: type=registry,ref=public.ecr.aws/${{ env.ECR_REPO }}:${{ needs.e2etest-preparation.outputs.version }}
+          cache-to: type=inline
+          platforms : linux/amd64, linux/arm64
+          labels: ${{ steps.meta.outputs.labels }}
+
+  get-testing-suites:
+    runs-on: ubuntu-22.04
+    needs: [create-test-ref]
+    outputs:
+      test-case-batch-key: ${{ steps.set-batches.outputs.batch-keys }}
+      test-case-batch-value: ${{ steps.set-batches.outputs.batch-values }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TESTING_FRAMEWORK_REPO }}
+          path: testing-framework
+          ref: ${{ needs.create-test-ref.outputs.testRef }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: aws-otel-collector
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: testing-framework/tools/batchTestGenerator/go.sum
+
+      - name: Create test batch key values
+        id: set-batches
+        run: |
+          cd testing-framework/tools/batchTestGenerator
+          go build
+          ./batchTestGenerator github --testCaseFilePath=$GITHUB_WORKSPACE/aws-otel-collector/.github/config/testcases.json --maxBatch=${{ env.MAX_JOBS }} \
+            --include=${{ env.BATCH_INCLUDED_SERVICES }}
+      - name: List testing suites
+        run: |
+          echo ${{ steps.set-batches.outputs.batch-keys }}
+          echo ${{ steps.set-batches.outputs.batch-values }}
+
+  run-batch-job:
+    runs-on: ubuntu-22.04
+    needs: [get-testing-suites, e2etest-release, e2etest-preparation, create-test-ref, build-aotutil]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.get-testing-suites.outputs.test-case-batch-key) }}
+
+    steps:
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '11'
+
+      - name: Set up terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Configure AWS Credentials
+        if: steps.e2etest-eks.outputs.cache-hit != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
+          aws-region: us-west-2
+          # 6 hours
+          role-duration-seconds: 21600
+
+      - name: Checkout testing framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TESTING_FRAMEWORK_REPO }}
+          path: testing-framework
+          ref: ${{ needs.create-test-ref.outputs.testRef }}
+
+      - name: create test-case-batch file
+        run: |
+          jsonStr='${{ needs.get-testing-suites.outputs.test-case-batch-value }}'
+          jsonStr="$(jq -r '.${{ matrix.BatchKey }} | join("\n")' <<< "${jsonStr}")"
+          echo "$jsonStr" >> testing-framework/terraform/test-case-batch
+          cat testing-framework/terraform/test-case-batch
+      - name: Get TTL_DATE for cache
+        id: date
+        run: echo "ttldate=$(date -u -d "+7 days" +%s)" >> $GITHUB_OUTPUT
+
+      - name: Restore aotutil
+        uses: actions/cache@v3
+        with:
+          key: "aotutil_${{ hashFiles('testing-framework/cmd/aotutil/*.go') }}_${{ hashFiles('testing-framework/cmd/aotutil/go.sum') }}"
+          path: testing-framework/cmd/aotutil/aotutil
+
+      - name: run tests
+        run: |
+          export TTL_DATE=${{ steps.date.outputs.ttldate }}
+          export TF_VAR_aoc_version=${{ needs.e2etest-preparation.outputs.version }}
+          cd testing-framework/terraform
+          make execute-batch-test
+
+      - name: output cache misses
+        if: ${{ failure() }}
+        run: |
+          export TF_VAR_aoc_version=${{ needs.e2etest-preparation.outputs.version }}
+          cd testing-framework/terraform
+          make checkCacheHits
+
+      # This is here just in case workflow cancel
+      # We first kill terraform processes to ensure that no state
+      # file locks are being held from SIGTERMS dispatched in previous
+      # steps.
+      - name: Destroy resources
+        if: ${{ cancelled() }}
+        shell: bash {0}
+        run: |
+          ps -ef | grep terraform | grep -v grep | awk '{print $2}' | xargs -n 1 kill
+          cd testing-framework/terraform
+          make terraformCleanup
+
+  run-collector-testbed:
+    runs-on: ubuntu-22.04
+    needs: [ e2etest-preparation, e2etest-release, create-test-ref]
+
+    steps:
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'corretto'
+          java-version: '17'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
+          aws-region: us-west-2
+          # 6 hours
+          role-duration-seconds: 21600
+
+      - name: Login to Public Integration Test ECR
+        uses: docker/login-action@v3
+        with:
+          registry: public.ecr.aws
+        env:
+          AWS_REGION: us-east-1
+
+      - name: Checkout testing framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TESTING_FRAMEWORK_REPO }}
+          path: testing-framework
+          ref: ${{ needs.create-test-ref.outputs.testRef }}
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+
+      - name: Run tests
+        run: |
+          export TEST_IMAGE=public.ecr.aws/${{ env.ECR_REPO }}:${{ needs.e2etest-preparation.outputs.version }}
+          cd testing-framework/adot-testbed
+          ./gradlew test --rerun-tasks --info
+
+  clean-ssm-package:
+    runs-on: ubuntu-22.04
+    if: ${{ always() && needs.e2etest-preparation.result == 'success' }}
+    needs: [run-batch-job,e2etest-preparation]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: restore cached packages
+        id: cache_packages
+        uses: actions/cache@v3
+        with:
+          path: "${{ env.PACKAGING_ROOT }}"
+          key: "cached_packages_${{ github.run_id }}"
+
+      - name: Get SSM package version
+        id: versioning
+        if: steps.cache_packages.outputs.cache-hit == 'true'
+        run: |
+          ssm_pkg_version=$(cat $PACKAGING_ROOT/VERSION)
+          echo "ssm_pkg_version=$ssm_pkg_version" >> $GITHUB_OUTPUT
+      - name: Rollback SSM default version
+        if: steps.cache_packages.outputs.cache-hit == 'true'
+        run: |
+          ssm_package_name=${{ env.SSM_PACKAGE_NAME }} version=${{ steps.versioning.outputs.ssm_pkg_version }} bash tools/ssm/ssm_rollback_default_version.sh
+      - name: clean up SSM test package
+        if: steps.cache_packages.outputs.cache-hit == 'true'
+        run: |
+          aws ssm describe-document --name ${{ env.SSM_PACKAGE_NAME }} --version-name ${{ steps.versioning.outputs.ssm_pkg_version }} >/dev/null 2>&1 && \
+            aws ssm delete-document --name ${{ env.SSM_PACKAGE_NAME }} --version-name ${{ steps.versioning.outputs.ssm_pkg_version }}
+
+  validate-all-tests-pass:
+    runs-on: ubuntu-22.04
+    needs: [run-batch-job,e2etest-preparation,create-test-ref,get-testing-suites]
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TESTING_FRAMEWORK_REPO }}
+          path: testing-framework
+          ref: ${{ needs.create-test-ref.outputs.testRef }}
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
+          aws-region: us-west-2
+
+      # combine all test-case-batch values
+      - name: create test-case-batch file
+        run: |
+          jsonStr='${{ needs.get-testing-suites.outputs.test-case-batch-value }}'
+          jsonStr="$(jq -r '.[] | join("\n")' <<< "${jsonStr}")"
+          echo "$jsonStr" >> testing-framework/terraform/test-case-batch
+          cat testing-framework/terraform/test-case-batch
+
+      - name: output cache misses
+        run: |
+          export TF_VAR_aoc_version=${{ needs.e2etest-preparation.outputs.version }}
+          cd testing-framework/terraform
+          make checkCacheHits
+
+  release-candidate:
+    runs-on: ubuntu-22.04
+    if: ${{ always() && needs.validate-all-tests-pass.result == 'success'
+            && needs.run-collector-testbed.result == 'success'
+            && (startsWith(github.ref_name, 'release/v') || github.ref_name == 'main') }}
+    needs: [validate-all-tests-pass, run-collector-testbed]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: restore cached packages
+        uses: actions/cache@v3
+        with:
+          path: "${{ env.PACKAGING_ROOT }}"
+          key: "cached_packages_${{ github.run_id }}"
+
+      - name: prepare production version
+        run: |
+          TESTING_VERSION=`cat $PACKAGING_ROOT/VERSION`
+          VERSION=`echo $TESTING_VERSION | awk -F "-" '{print $1}'`
+          echo $VERSION > $PACKAGING_ROOT/VERSION
+          echo $GITHUB_SHA > $PACKAGING_ROOT/GITHUB_SHA
+          echo $TESTING_VERSION > $PACKAGING_ROOT/TESTING_VERSION
+
+      - name: upload packages as release candidate on s3
+        run: |
+          tar czvf $GITHUB_SHA.tar.gz build
+          aws s3 cp $GITHUB_SHA.tar.gz s3://aws-otel-collector-release-candidate/$GITHUB_SHA.tar.gz
+
+      - name: Trigger performance test
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: "${{ secrets.REPO_WRITE_ACCESS_TOKEN }}"
+          event-type: trigger-perf
+          client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'
+
+  publish-ci-status:
+    runs-on: ubuntu-22.04
+    needs: [release-candidate]
+    if: always()
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Publish CI status
+        run: |
+          if [ '${{ needs.release-candidate.result }}' = 'success' ]; then
+            aws cloudwatch put-metric-data --namespace 'ADOT/GitHubActions' \
+              --metric-name Success \
+              --dimensions repository=${{ github.repository }},branch=${{ github.ref_name }},workflow=CI \
+              --value 1.0
+          else
+            aws cloudwatch put-metric-data --namespace 'ADOT/GitHubActions' \
+              --metric-name Success \
+              --dimensions repository=${{ github.repository }},branch=${{ github.ref_name }},workflow=CI \
+              --value 0.0
+          fi

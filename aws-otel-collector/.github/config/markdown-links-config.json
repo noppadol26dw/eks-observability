@@ -1,0 +1,28 @@
+{
+    "ignorePatterns": [
+        {
+            "pattern": "http(s)?://\\d+\\.\\d+\\.\\d+\\.\\d+"
+        },
+        {
+            "pattern": "http(s)?://localhost"
+        },
+        {
+            "pattern": "http(s)?://example.com"
+        },
+        {
+            "pattern": "https://github.com/aws-observability/aws-otel-collector/compare/v\\d+.\\d+.\\d+...v\\d+.\\d+.\\d+"
+        },
+        {
+            "pattern": "https://github.com/aws-observability/aws-otel-collector/tree/v\\d+.\\d+.\\d+"
+        }
+    ],
+    "aliveStatusCodes": [429, 200],
+    "httpHeaders": [
+        {
+            "urls": ["https://docs.github.com/"],
+            "headers": {
+                "Accept-Encoding": "zstd, br, gzip, deflate"
+            }
+        }
+    ]
+}
