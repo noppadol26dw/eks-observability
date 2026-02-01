@@ -11,6 +11,13 @@ Short reference for terms used in this project. See [OpenTelemetry Glossary](htt
 | **Traces** | Path of a request across services; each step is a **Span**. |
 | **Span** | Single unit of work (e.g. one HTTP request, one DB call); has name, timing, attributes. |
 | **OTLP** | OpenTelemetry Protocol — standard way to send telemetry to a collector or backend. |
+| **Signals** | OTel term for outputs that describe system activity: traces, metrics, logs, and baggage. |
+| **Receiver** | Collects telemetry from sources. Can be pull-based (scrape) or push-based (listen). Examples: OTLP, file log. |
+| **Processor** | Transforms or filters telemetry (e.g. batch, add attributes, sampling). |
+| **Connector** | Consumes one signal type and produces another (e.g. span-to-metrics). |
+| **Extension** | Adds capabilities to the collector (e.g. storage for file offsets, health checks). |
+| **Pipeline** | Flow of data: receivers → processors → exporters. Defined under `service.pipelines` in config. |
+| **Baggage** | Context passed between signals to correlate logs, traces, and metrics. |
 | **Exporter** | Component that sends data (trace/metric/log) to a backend (e.g. OTLP exporter). |
 | **TracerProvider / MeterProvider / LoggerProvider** | Global setup for creating traces, metrics, and logs in the app. |
 | **Propagator** | How trace context (trace ID, etc.) is passed across services (e.g. X-Ray propagator). |
@@ -22,6 +29,8 @@ For the full OTEL + ADOT architecture, see [architecture](architecture.md).
 
 ## Links
 
+- [Collector Configuration](https://opentelemetry.io/docs/collector/configuration/) — receivers, processors, exporters, pipelines
+- [Collector Contrib (receivers, exporters)](https://github.com/open-telemetry/opentelemetry-collector-contrib) — file log, Kafka, many backends
 - [OpenTelemetry Glossary](https://opentelemetry.io/docs/concepts/glossary/)
 - [OpenTelemetry Observability Primer](https://opentelemetry.io/docs/concepts/observability-primer/)
 - [ADOT Go SDK Manual Instrumentation](https://aws-otel.github.io/docs/getting-started/go-sdk/manual-instr/)

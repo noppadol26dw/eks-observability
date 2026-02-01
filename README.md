@@ -11,6 +11,22 @@ Learn observability (logs, metrics, tracing) on AWS EKS using a Go app with Open
 - **Terminology:** [docs/terminology.md](docs/terminology.md)
 - **OTEL + ADOT architecture:** [docs/architecture.md](docs/architecture.md)
 
+### Why Open Telemetry?
+
+- **Vendor-agnostic:** No lock-in. You can switch backends (CloudWatch, DataDog, Grafana, etc.) without changing app code.
+- **Single APIs:** One set of conventions for logs, metrics, traces across languages and frameworks.
+- **Correlated telemetry:** Trace IDs and span IDs link logs, metrics, and traces so you can debug across signals.
+
+### Collector config in a nutshell
+
+Collector config uses **receivers**, **processors**, and **exporters**:
+
+- **Receivers** — Collect telemetry (pull or push). Examples: OTLP, file log, Prometheus.
+- **Processors** — Transform or filter (e.g. batch, add attributes).
+- **Exporters** — Send data out (CloudWatch, X-Ray, file, another collector).
+
+You wire them in **pipelines** under the `service` section. Example: `receivers: [otlp] → processors: [batch] → exporters: [awsxray]`.
+
 ---
 
 ## Step 1: Prerequisites
@@ -125,6 +141,8 @@ curl http://localhost:8080/hello
 ```
 
 **3.6 View data in AWS.**
+
+- **Tip:** To test your config without AWS, use a [file exporter](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/exporter/fileexporter/README.md) and dump logs/traces to a local file. Swap it for AWS exporters once it works.
 
 - **X-Ray:** AWS Console → X-Ray → Traces (or Service map). Example trace for a `GET /hello` request:
 
